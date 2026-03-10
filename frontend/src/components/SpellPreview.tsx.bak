@@ -1,0 +1,628 @@
+import { useRef, useEffect, useCallback } from "react";
+import type { Spell, ParticlePattern } from "../types/spell";
+
+interface Props { spell: Spell; }
+
+/* ─── particle ─── */
+interface P {
+  x: number; y: number; vx: number; vy: number;
+  life: number; maxLife: number; size: number;
+  color?: string; shape: number; rot: number;
+  rotSpeed: number; glow: number;
+}
+
+/* ─── Mapping MC particle → canvas style ─── */
+const PSTYLE: Record<string, { shape: number; sz: [number, number]; gMul: number; drift: number; col?: string }> = {
+  FLAME:        { shape: 0, sz: [1.5, 3.5], gMul: 1.8, drift: 1.2 },
+  SOUL_FIRE_FLAME: { shape: 0, sz: [1.5, 3.5], gMul: 2.0, drift: 1.0, col: "rgba(0,200,255,0.7)" },
+  SMOKE:        { shape: 0, sz: [2, 5], gMul: 0.5, drift: 1.8, col: "rgba(100,100,100,0.6)" },
+  ENCHANT:      { shape: 1, sz: [1, 2.5], gMul: 1.4, drift: 0.6 },
+  DUST:         { shape: 0, sz: [1, 3], gMul: 1.0, drift: 0.8 },
+  HEART:        { shape: 1, sz: [2, 3], gMul: 0.6, drift: 0.3, col: "rgba(255,80,80,0.8)" },
+  CRIT:         { shape: 1, sz: [1, 2], gMul: 1.2, drift: 1.5 },
+  WITCH:        { shape: 0, sz: [1, 3], gMul: 1.0, drift: 1.0, col: "rgba(160,0,200,0.7)" },
+  END_ROD:      { shape: 0, sz: [0.8, 2], gMul: 1.6, drift: 0.5, col: "rgba(255,255,200,0.8)" },
+  DRAGON_BREATH:{ shape: 0, sz: [1.5, 4], gMul: 1.2, drift: 1.5, col: "rgba(180,0,255,0.6)" },
+  ELECTRIC_SPARK:{ shape: 3, sz: [1, 3], gMul: 2.0, drift: 2.0, col: "rgba(100,200,255,0.9)" },
+  SNOWFLAKE:    { shape: 1, sz: [1.5, 3], gMul: 0.4, drift: 0.4, col: "rgba(200,220,255,0.8)" },
+  CHERRY_LEAVES:{ shape: 2, sz: [1, 2.5], gMul: 0.3, drift: 0.5, col: "rgba(255,150,180,0.7)" },
+  CAMPFIRE_SIGNAL_SMOKE: { shape: 0, sz: [3, 6], gMul: 0.3, drift: 0.5, col: "rgba(140,140,140,0.4)" },
+  DRIPPING_LAVA:{ shape: 0, sz: [1, 2], gMul: 0.8, drift: 0.3, col: "rgba(255,120,0,0.8)" },
+  WAX_ON:       { shape: 2, sz: [1, 2], gMul: 0.6, drift: 0.5, col: "rgba(255,200,50,0.7)" },
+  SCULK_CHARGE: { shape: 0, sz: [1.5, 3], gMul: 1.0, drift: 1.0, col: "rgba(0,150,150,0.7)" },
+  SONIC_BOOM:   { shape: 3, sz: [2, 4], gMul: 2.5, drift: 3.0, col: "rgba(100,200,255,0.6)" },
+  TRIAL_SPAWNER_DETECTION: { shape: 1, sz: [1, 2], gMul: 1.2, drift: 1.0, col: "rgba(255,100,50,0.7)" },
+};
+
+const ISTYLE: Record<string, { rings: number; debris: number; wave: boolean; shake: number }> = {
+  EXPLOSION:         { rings: 3, debris: 20, wave: true,  shake: 4 },
+  LARGE_SMOKE:       { rings: 1, debris: 12, wave: false, shake: 1 },
+  FLASH:             { rings: 2, debris: 8,  wave: true,  shake: 6 },
+  SWEEP_ATTACK:      { rings: 1, debris: 6,  wave: false, shake: 2 },
+  EXPLOSION_EMITTER: { rings: 4, debris: 30, wave: true,  shake: 8 },
+  TOTEM_OF_UNDYING:  { rings: 3, debris: 25, wave: true,  shake: 5 },
+  SONIC_BOOM:        { rings: 5, debris: 15, wave: true,  shake: 10 },
+  ELECTRIC_SPARK:    { rings: 2, debris: 18, wave: true,  shake: 3 },
+  CAMPFIRE_SIGNAL_SMOKE: { rings: 1, debris: 10, wave: false, shake: 1 },
+};
+
+export function SpellPreview({ spell }: Props) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animRef = useRef(0);
+  const particles = useRef<P[]>([]);
+  const tRef = useRef(0);
+  const shakeRef = useRef({ x: 0, y: 0, i: 0 });
+
+  const [r, g, b] = spell.visual.color;
+  const colorStr = `rgb(${r},${g},${b})`;
+  const ca = useCallback((a: number) => `rgba(${r},${g},${b},${a})`, [r, g, b]);
+  const cb = useCallback((a: number) => {
+    return `rgba(${Math.min(255, r + 60)},${Math.min(255, g + 60)},${Math.min(255, b + 60)},${a})`;
+  }, [r, g, b]);
+
+  // Resolve trail data: prefer particle_layers[0], fallback to legacy particle_trail
+  const trailLayer = spell.visual.particle_layers?.[0] ?? spell.visual.particle_trail ?? { particle: "FLAME", count: 3, frequency: 1 };
+  const trailParticle = trailLayer.particle;
+  const trailCount = trailLayer.count;
+  const cp = trailLayer.custom;
+
+  const ps = PSTYLE[trailParticle] ?? PSTYLE.FLAME;
+  const is = ISTYLE[spell.visual.impact.particle] ?? ISTYLE.EXPLOSION;
+
+  const spawn = useCallback(
+    (x: number, y: number, spread = 1, ov?: Partial<Pick<P, "color" | "shape" | "size" | "glow" | "maxLife">>) => {
+      const sMin = cp?.enabled ? cp.size_min : ps.sz[0];
+      const sMax = cp?.enabled ? cp.size_max : ps.sz[1];
+      particles.current.push({
+        x, y,
+        vx: (Math.random() - 0.5) * spread * 2 * (cp?.enabled ? cp.speed : 1),
+        vy: (Math.random() - 0.5) * spread * 2 * (cp?.enabled ? cp.speed : 1),
+        life: 1, maxLife: ov?.maxLife ?? (cp?.enabled ? cp.lifetime : 0.4 + Math.random() * 0.6),
+        size: ov?.size ?? sMin + Math.random() * (sMax - sMin),
+        color: ov?.color, shape: ov?.shape ?? ps.shape,
+        rot: Math.random() * Math.PI * 2, rotSpeed: (Math.random() - 0.5) * 6,
+        glow: ov?.glow ?? ps.gMul,
+      });
+    }, [ps, cp]);
+
+  /* ─── pattern spawners ─── */
+  const spawnPattern = useCallback(
+    (cx: number, cy: number, t: number, pattern: ParticlePattern, density: number, spread: number) => {
+      const count = Math.ceil(density * 0.4);
+      for (let i = 0; i < count; i++) {
+        let px = cx, py = cy;
+        switch (pattern) {
+          case "spiral": {
+            const a = t * 4 + i * (Math.PI * 2 / count);
+            const sr = 5 + Math.sin(t * 2) * 3;
+            px = cx + Math.cos(a) * sr;
+            py = cy + Math.sin(a) * sr;
+            break;
+          }
+          case "ring": {
+            const a = (i / count) * Math.PI * 2 + t * 0.5;
+            const rr = 8 + spread * 2;
+            px = cx + Math.cos(a) * rr;
+            py = cy + Math.sin(a) * rr;
+            break;
+          }
+          case "helix": {
+            const a = t * 5 + i * (Math.PI * 2 / count);
+            const hx = Math.cos(a) * 6;
+            const hy = Math.sin(a) * 3;
+            px = cx + hx;
+            py = cy + hy - (t % 1) * 15;
+            break;
+          }
+          case "burst": {
+            const a = Math.random() * Math.PI * 2;
+            const d = Math.random() * spread * 5;
+            px = cx + Math.cos(a) * d;
+            py = cy + Math.sin(a) * d;
+            break;
+          }
+          case "wave": {
+            px = cx + (i - count / 2) * 3;
+            py = cy + Math.sin(t * 4 + i * 0.5) * 8;
+            break;
+          }
+          default: // linear
+            px = cx + (Math.random() - 0.5) * spread * 4;
+            py = cy + (Math.random() - 0.5) * spread * 2;
+        }
+        spawn(px, py, spread * 0.3, { maxLife: cp?.lifetime ?? 0.5 });
+      }
+    }, [spawn, cp]);
+
+  /* ─── shape drawers ─── */
+  const drawStar = (ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rot: number) => {
+    ctx.beginPath();
+    for (let i = 0; i < 5; i++) {
+      const a = rot + i * 2 * Math.PI / 5 - Math.PI / 2;
+      const aI = a + Math.PI / 5;
+      ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+      ctx.lineTo(cx + Math.cos(aI) * r * 0.4, cy + Math.sin(aI) * r * 0.4);
+    }
+    ctx.closePath();
+  };
+
+  const drawDiamond = (ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rot: number) => {
+    ctx.beginPath();
+    for (let i = 0; i < 4; i++) {
+      const a = rot + i * Math.PI / 2;
+      ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    }
+    ctx.closePath();
+  };
+
+  const drawSpark = (ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number, rot: number) => {
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(rot); ctx.beginPath();
+    ctx.moveTo(-r, 0); ctx.lineTo(0, -r * 0.3); ctx.lineTo(r, 0); ctx.lineTo(0, r * 0.3);
+    ctx.closePath(); ctx.restore();
+  };
+
+  const drawHeart = (ctx: CanvasRenderingContext2D, cx: number, cy: number, s: number) => {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy + s * 0.3);
+    ctx.bezierCurveTo(cx - s, cy - s * 0.5, cx - s * 0.5, cy - s, cx, cy - s * 0.5);
+    ctx.bezierCurveTo(cx + s * 0.5, cy - s, cx + s, cy - s * 0.5, cx, cy + s * 0.3);
+    ctx.closePath();
+  };
+
+  useEffect(() => {
+    const cvs = canvasRef.current;
+    if (!cvs) return;
+    const ctx = cvs.getContext("2d")!;
+    const W = cvs.width, H = cvs.height;
+    const midX = W / 2, midY = H / 2;
+    let last = performance.now();
+
+    const draw = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.05);
+      last = now;
+      tRef.current += dt;
+      const t = tRef.current;
+      const sk = shakeRef.current;
+      sk.i *= 0.86;
+      if (sk.i > 0.2) { sk.x = (Math.random() - 0.5) * sk.i; sk.y = (Math.random() - 0.5) * sk.i; }
+      else { sk.x = 0; sk.y = 0; }
+
+      ctx.save();
+      ctx.translate(sk.x, sk.y);
+
+      // BG
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, "#06061a"); bg.addColorStop(1, "#0c0c28");
+      ctx.fillStyle = bg; ctx.fillRect(-10, -10, W + 20, H + 20);
+
+      // Stars
+      ctx.fillStyle = "rgba(255,255,255,0.03)";
+      for (let i = 0; i < 30; i++) {
+        const sx = (i * 97.3 + Math.sin(i * 1.7) * 40) % W;
+        const sy = (i * 53.7 + Math.cos(i * 2.3) * 20) % (H * 0.6);
+        const ss = 0.5 + Math.sin(t * 0.5 + i) * 0.3;
+        ctx.beginPath(); ctx.arc(sx, sy, ss, 0, Math.PI * 2); ctx.fill();
+      }
+
+      // Grid
+      ctx.strokeStyle = "rgba(255,255,255,0.02)"; ctx.lineWidth = 1;
+      for (let gx = 0; gx < W; gx += 24) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke(); }
+      for (let gy = 0; gy < H; gy += 24) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
+
+      // Ground
+      const gY = midY + 60;
+      const gGrad = ctx.createLinearGradient(0, gY, 0, H);
+      gGrad.addColorStop(0, "rgba(255,255,255,0.05)"); gGrad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = gGrad; ctx.fillRect(0, gY, W, H - gY);
+      ctx.strokeStyle = "rgba(255,255,255,0.06)";
+      ctx.beginPath(); ctx.moveTo(0, gY); ctx.lineTo(W, gY); ctx.stroke();
+
+      // Caster
+      const cX = 50, cY = gY;
+      ctx.fillStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath(); ctx.ellipse(cX, cY + 2, 12, 3, 0, 0, Math.PI * 2); ctx.fill();
+      // body
+      ctx.fillStyle = "rgba(160,160,180,0.8)";
+      ctx.fillRect(cX - 5, cY - 32, 10, 20);
+      // head
+      ctx.fillStyle = "rgba(190,190,210,0.9)";
+      ctx.beginPath(); ctx.arc(cX, cY - 36, 7, 0, Math.PI * 2); ctx.fill();
+      // arm glow
+      const armG = 0.4 + Math.sin(t * 4) * 0.3;
+      const armGrd = ctx.createRadialGradient(cX + 10, cY - 24, 0, cX + 10, cY - 24, 12);
+      armGrd.addColorStop(0, ca(armG * 0.6)); armGrd.addColorStop(1, ca(0));
+      ctx.fillStyle = armGrd;
+      ctx.beginPath(); ctx.arc(cX + 10, cY - 24, 12, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = ca(armG);
+      ctx.beginPath(); ctx.arc(cX + 10, cY - 24, 4, 0, Math.PI * 2); ctx.fill();
+      // legs
+      ctx.strokeStyle = "rgba(140,140,160,0.7)"; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.moveTo(cX - 3, cY - 12); ctx.lineTo(cX - 5, cY); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cX + 3, cY - 12); ctx.lineTo(cX + 5, cY); ctx.stroke();
+      // label
+      ctx.fillStyle = "rgba(255,255,255,0.3)"; ctx.font = "9px 'Inter',sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("Joueur", cX, cY + 16);
+
+      // ambient
+      if (Math.random() < 0.12)
+        spawn(cX + (Math.random() - 0.5) * 24, cY - 22 + (Math.random() - 0.5) * 30, 0.2,
+          { size: 0.6, maxLife: 1.2, glow: 0.3 });
+
+      const castType = spell.mechanics.cast_type;
+
+      /* ═══════ PROJECTILE ═══════ */
+      if (castType === "projectile") {
+        const speed = spell.mechanics.speed ?? 2;
+        const range = Math.min(spell.mechanics.range, 30);
+        const maxDist = (range / 30) * (W - 130);
+        const travelTime = range / speed;
+        const cycleTime = travelTime + 1.4;
+        const loopT = t % cycleTime;
+        const progress = Math.min(loopT / travelTime, 1);
+        const pX = cX + 28 + progress * maxDist;
+        const pY = cY - 24;
+
+        if (progress < 1) {
+          // trail gradient
+          const trailLen = Math.min(progress * maxDist, 70);
+          const tg = ctx.createLinearGradient(pX - trailLen, pY, pX, pY);
+          tg.addColorStop(0, ca(0)); tg.addColorStop(1, ca(0.2));
+          ctx.strokeStyle = tg; ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.moveTo(pX - trailLen, pY); ctx.lineTo(pX, pY); ctx.stroke();
+
+          // custom pattern particles
+          if (cp?.enabled) {
+            if (Math.random() < 0.5) spawnPattern(pX, pY, t, cp.pattern, cp.density, cp.spread);
+          } else {
+            const cnt = trailCount;
+            for (let i = 0; i < cnt; i++) {
+              if (Math.random() < 0.45)
+                spawn(pX - Math.random() * 10, pY, ps.drift, { maxLife: 0.3 + Math.random() * 0.4 });
+            }
+          }
+
+          // sparks
+          if (Math.random() < 0.25)
+            spawn(pX, pY, 0.8, { color: cb(0.9), size: 0.6, maxLife: 0.15, shape: 3, glow: 0.5 });
+
+          // outer glow
+          const oR = 20 + Math.sin(t * 12) * 4;
+          const g3 = ctx.createRadialGradient(pX, pY, 0, pX, pY, oR);
+          g3.addColorStop(0, ca(0.35)); g3.addColorStop(0.4, ca(0.1)); g3.addColorStop(1, ca(0));
+          ctx.fillStyle = g3; ctx.beginPath(); ctx.arc(pX, pY, oR, 0, Math.PI * 2); ctx.fill();
+
+          // mid glow
+          const g2 = ctx.createRadialGradient(pX, pY, 0, pX, pY, 9);
+          g2.addColorStop(0, cb(0.9)); g2.addColorStop(0.5, ca(0.5)); g2.addColorStop(1, ca(0));
+          ctx.fillStyle = g2; ctx.beginPath(); ctx.arc(pX, pY, 9, 0, Math.PI * 2); ctx.fill();
+
+          // core
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.beginPath(); ctx.arc(pX, pY, 3, 0, Math.PI * 2); ctx.fill();
+
+          // rotating rays
+          ctx.save(); ctx.translate(pX, pY); ctx.rotate(t * 3);
+          for (let i = 0; i < 6; i++) {
+            const a = i * Math.PI / 3;
+            ctx.strokeStyle = ca(0.12 + Math.sin(t * 8 + i) * 0.08);
+            ctx.lineWidth = 1; ctx.beginPath();
+            ctx.moveTo(Math.cos(a) * 5, Math.sin(a) * 5);
+            ctx.lineTo(Math.cos(a) * 16, Math.sin(a) * 16);
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          // ground shadow
+          ctx.fillStyle = ca(0.06);
+          ctx.beginPath(); ctx.ellipse(pX, gY + 2, 10, 2.5, 0, 0, Math.PI * 2); ctx.fill();
+        }
+
+        // impact
+        if (progress >= 1) {
+          const iT = loopT - travelTime;
+          const iX = cX + 28 + maxDist, iY = pY;
+          if (iT < 1.2) {
+            if (iT < dt * 2) {
+              shakeRef.current.i = is.shake;
+              for (let i = 0; i < is.debris; i++) {
+                const a = Math.random() * Math.PI * 2;
+                const sp = 1.5 + Math.random() * 4;
+                spawn(iX, iY, 0, { size: 1 + Math.random() * 3, maxLife: 0.4 + Math.random() * 0.5, glow: 1.5, shape: Math.random() < 0.5 ? 2 : 0 });
+                const p = particles.current[particles.current.length - 1];
+                p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp - Math.random() * 2;
+              }
+            }
+            if (is.wave) {
+              for (let rn = 0; rn < is.rings; rn++) {
+                const rT = iT - rn * 0.07;
+                if (rT > 0 && rT < 0.5) {
+                  const rr = rT * 90;
+                  const al = Math.max(0, 1 - rT / 0.5);
+                  ctx.strokeStyle = ca(al * 0.5);
+                  ctx.lineWidth = 2.5 - rT * 4;
+                  if (ctx.lineWidth > 0.2) { ctx.beginPath(); ctx.arc(iX, iY, rr, 0, Math.PI * 2); ctx.stroke(); }
+                }
+              }
+            }
+            const fA = Math.max(0, 1 - iT / 0.3);
+            if (fA > 0) {
+              const fr = 35 * fA;
+              const fg = ctx.createRadialGradient(iX, iY, 0, iX, iY, fr);
+              fg.addColorStop(0, `rgba(255,255,255,${fA * 0.7})`); fg.addColorStop(0.3, ca(fA * 0.5)); fg.addColorStop(1, ca(0));
+              ctx.fillStyle = fg; ctx.beginPath(); ctx.arc(iX, iY, fr, 0, Math.PI * 2); ctx.fill();
+            }
+            const rA = Math.max(0, 1 - iT / 0.8);
+            if (rA > 0) {
+              const rg = ctx.createRadialGradient(iX, iY, 0, iX, iY, 22);
+              rg.addColorStop(0, ca(rA * 0.3)); rg.addColorStop(1, ca(0));
+              ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(iX, iY, 22, 0, Math.PI * 2); ctx.fill();
+            }
+          }
+        }
+      }
+
+      /* ═══════ AREA ═══════ */
+      if (castType === "area") {
+        const radius = spell.mechanics.radius ?? 5;
+        const drawR = (radius / 15) * 80;
+        const tX = midX + 60, tY = gY;
+        const dur = spell.mechanics.area_duration ?? 0;
+        const pulses = spell.mechanics.area_pulses ?? 1;
+
+        // connection beam
+        ctx.strokeStyle = ca(0.12); ctx.lineWidth = 1;
+        ctx.setLineDash([4, 6]);
+        ctx.beginPath(); ctx.moveTo(cX + 12, cY - 26); ctx.lineTo(tX, tY - 5); ctx.stroke();
+        ctx.setLineDash([]);
+        const beamP = (t * 0.8) % 1;
+        const dX = cX + 12 + (tX - cX - 12) * beamP;
+        const dY = cY - 26 + (tY - 5 - cY + 26) * beamP;
+        ctx.fillStyle = ca(0.5); ctx.beginPath(); ctx.arc(dX, dY, 2, 0, Math.PI * 2); ctx.fill();
+
+        const pulse = Math.sin(t * 2.5) * 0.1 + 0.9;
+
+        ctx.save(); ctx.translate(tX, tY);
+
+        // ground fill
+        const aG = ctx.createRadialGradient(0, 0, 0, 0, 0, drawR);
+        aG.addColorStop(0, ca(0.2 * pulse)); aG.addColorStop(0.6, ca(0.06 * pulse)); aG.addColorStop(1, ca(0));
+        ctx.fillStyle = aG;
+        ctx.beginPath(); ctx.ellipse(0, 0, drawR * pulse, drawR * 0.4 * pulse, 0, 0, Math.PI * 2); ctx.fill();
+
+        // rings
+        ctx.strokeStyle = ca(0.5 * pulse); ctx.lineWidth = 1.5;
+        ctx.beginPath(); ctx.ellipse(0, 0, drawR * pulse, drawR * 0.4 * pulse, 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.strokeStyle = ca(0.2 * pulse); ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.ellipse(0, 0, drawR * 0.5 * pulse, drawR * 0.2 * pulse, 0, 0, Math.PI * 2); ctx.stroke();
+
+        // rune dots
+        for (let i = 0; i < 8; i++) {
+          const a = t * 0.5 + i * Math.PI * 2 / 8;
+          ctx.fillStyle = cb(0.5 + Math.sin(t * 3 + i) * 0.3);
+          ctx.beginPath(); ctx.arc(Math.cos(a) * drawR * pulse, Math.sin(a) * drawR * 0.4 * pulse, 2.5, 0, Math.PI * 2); ctx.fill();
+        }
+
+        ctx.restore();
+
+        // custom or regular particles
+        if (cp?.enabled) {
+          if (Math.random() < 0.4) spawnPattern(tX, tY - 5, t, cp.pattern, cp.density, cp.spread);
+        } else {
+          const pCnt = trailCount;
+          if (Math.random() < 0.3 * pCnt) {
+            const a = Math.random() * Math.PI * 2;
+            const d = Math.random() * drawR;
+            spawn(tX + Math.cos(a) * d, tY + Math.sin(a) * drawR * 0.4 * 0.5 - Math.random() * 15, 0.3, { maxLife: 0.6 + Math.random() * 0.5 });
+          }
+        }
+
+        // pillar
+        const pillarT = t % 3;
+        if (pillarT < 0.6) {
+          const pA = Math.max(0, 1 - pillarT / 0.6) * 0.18;
+          const pG = ctx.createLinearGradient(tX, tY - 90, tX, tY);
+          pG.addColorStop(0, ca(0)); pG.addColorStop(0.5, ca(pA)); pG.addColorStop(1, ca(pA * 0.5));
+          ctx.fillStyle = pG; ctx.fillRect(tX - 7, tY - 90, 14, 90);
+        }
+
+        // pulse waves (for multi-pulse)
+        if (pulses > 1) {
+          const pulseInterval = (dur || 2) / pulses;
+          const pulsePhase = t % pulseInterval;
+          if (pulsePhase < 0.3) {
+            const pwR = (pulsePhase / 0.3) * drawR * 1.2;
+            const pwA = Math.max(0, 1 - pulsePhase / 0.3);
+            ctx.strokeStyle = ca(pwA * 0.4); ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.ellipse(tX, tY, pwR, pwR * 0.4, 0, 0, Math.PI * 2); ctx.stroke();
+          }
+        }
+
+        ctx.fillStyle = "rgba(255,255,255,0.28)"; ctx.font = "9px 'Inter',sans-serif"; ctx.textAlign = "center";
+        ctx.fillText(`Rayon: ${radius}b${dur ? ` | ${dur}s` : ""}${pulses > 1 ? ` | ${pulses}x` : ""}`, tX, tY + drawR * 0.4 + 18);
+      }
+
+      /* ═══════ INSTANT ═══════ */
+      if (castType === "instant") {
+        const tX = midX + 40, tY = gY;
+
+        // target dummy
+        ctx.fillStyle = "rgba(200,70,70,0.5)";
+        ctx.fillRect(tX - 4, tY - 26, 8, 18);
+        ctx.beginPath(); ctx.arc(tX, tY - 30, 6, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = "rgba(140,140,160,0.4)"; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(tX - 3, tY - 8); ctx.lineTo(tX - 4, tY); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(tX + 3, tY - 8); ctx.lineTo(tX + 4, tY); ctx.stroke();
+        ctx.fillStyle = "rgba(255,255,255,0.22)"; ctx.font = "9px 'Inter',sans-serif"; ctx.textAlign = "center";
+        ctx.fillText("Cible", tX, tY + 16);
+
+        const cycleT = t % 2.2;
+        const castP = Math.min(cycleT / 0.35, 1);
+        const hitP = cycleT > 0.35 ? Math.min((cycleT - 0.35) / 0.15, 1) : 0;
+
+        // charge
+        if (castP < 1) {
+          const cR = 14 + castP * 10;
+          const cG = ctx.createRadialGradient(cX, cY - 24, 0, cX, cY - 24, cR);
+          cG.addColorStop(0, ca(castP * 0.45)); cG.addColorStop(1, ca(0));
+          ctx.fillStyle = cG; ctx.beginPath(); ctx.arc(cX, cY - 24, cR, 0, Math.PI * 2); ctx.fill();
+
+          if (cp?.enabled && Math.random() < castP * 0.6)
+            spawnPattern(cX, cY - 24, t, cp.pattern, cp.density * 0.5, cp.spread);
+          else if (Math.random() < castP * 0.5) {
+            const a = Math.random() * Math.PI * 2;
+            const d = 18 + Math.random() * 10;
+            spawn(cX + Math.cos(a) * d * (1 - castP), cY - 24 + Math.sin(a) * d * (1 - castP), 0.3,
+              { maxLife: 0.2, glow: 2, size: 1 });
+          }
+        }
+
+        // lightning beam
+        if (hitP > 0 && cycleT < 1.7) {
+          ctx.save();
+          ctx.strokeStyle = cb(0.85); ctx.lineWidth = 2.5;
+          ctx.shadowColor = colorStr; ctx.shadowBlur = 14;
+          ctx.beginPath(); ctx.moveTo(cX + 12, cY - 24);
+          const seg = 10;
+          for (let i = 1; i <= seg; i++) {
+            const f = i / seg;
+            const bx = cX + 12 + (tX - cX - 12) * f;
+            const by = cY - 24 + (tY - 20 - cY + 24) * f;
+            const j = i < seg ? (Math.random() - 0.5) * 14 : 0;
+            ctx.lineTo(bx + j, by + j);
+          }
+          ctx.stroke(); ctx.shadowBlur = 0; ctx.restore();
+
+          // secondary lightning
+          if (Math.random() < 0.3) {
+            ctx.save(); ctx.strokeStyle = ca(0.3); ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(cX + 12, cY - 24);
+            for (let i = 1; i <= 6; i++) {
+              const f = i / 6;
+              ctx.lineTo(
+                cX + 12 + (tX - cX - 12) * f + (Math.random() - 0.5) * 25,
+                cY - 24 + (tY - 20 - cY + 24) * f + (Math.random() - 0.5) * 25
+              );
+            }
+            ctx.stroke(); ctx.restore();
+          }
+
+          const hA = Math.max(0, 1 - (cycleT - 0.35) / 0.5);
+          if (hA > 0) {
+            const hG = ctx.createRadialGradient(tX, tY - 16, 0, tX, tY - 16, 30);
+            hG.addColorStop(0, `rgba(255,255,255,${hA * 0.6})`); hG.addColorStop(0.3, ca(hA * 0.4)); hG.addColorStop(1, ca(0));
+            ctx.fillStyle = hG; ctx.beginPath(); ctx.arc(tX, tY - 16, 30, 0, Math.PI * 2); ctx.fill();
+            const rR = (cycleT - 0.35) * 55;
+            ctx.strokeStyle = ca(hA * 0.4); ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.arc(tX, tY - 16, rR, 0, Math.PI * 2); ctx.stroke();
+          }
+
+          if (hitP > 0 && cycleT - 0.35 < dt * 2) {
+            shakeRef.current.i = 3;
+            for (let i = 0; i < 14; i++)
+              spawn(tX, tY - 16, 3, { glow: 2, maxLife: 0.3 + Math.random() * 0.3 });
+          }
+        }
+
+        if (cycleT > 1.7 && Math.random() < 0.1)
+          spawn(cX + (Math.random() - 0.5) * 18, cY - 24 + (Math.random() - 0.5) * 18, 0.2,
+            { maxLife: 0.5, glow: 0.5, size: 0.7 });
+      }
+
+      /* ═══════ EFFECTS PANEL ═══════ */
+      const fx = spell.effects;
+      if (fx.length > 0) {
+        const iY = 14, iX = W - 12;
+        ctx.textAlign = "right"; ctx.font = "8px 'Inter',sans-serif";
+        for (let i = 0; i < Math.min(fx.length, 6); i++) {
+          const ef = fx[i]; const eY = iY + i * 14;
+          let icon = "", lbl = "", eC = "rgba(255,255,255,0.4)";
+          switch (ef.type) {
+            case "damage": icon = "⚔"; lbl = `${ef.amount} ${ef.damage_type}`; eC = "rgba(239,80,80,0.6)"; break;
+            case "heal": icon = "💚"; lbl = `+${ef.amount} HP`; eC = "rgba(80,239,120,0.6)"; break;
+            case "status": icon = "☠"; lbl = `${ef.status} ${ef.duration}s`; eC = "rgba(245,180,50,0.6)"; break;
+            case "knockback": icon = "💨"; lbl = `×${ef.strength}`; eC = "rgba(100,160,255,0.6)"; break;
+          }
+          ctx.fillStyle = eC; ctx.fillText(`${icon} ${lbl}`, iX, eY);
+        }
+      }
+
+      /* ═══════ PARTICLES UPDATE ═══════ */
+      const pp = particles.current;
+      const grav = cp?.enabled ? cp.gravity * 0.5 : 0;
+      for (let i = pp.length - 1; i >= 0; i--) {
+        const p = pp[i];
+        p.x += p.vx; p.y += p.vy;
+        p.vy -= 0.02 - grav * 0.02;
+        p.vx *= 0.97; p.vy *= 0.97;
+        p.life -= dt / p.maxLife;
+        p.rot += p.rotSpeed * dt;
+        if (p.life <= 0) { pp.splice(i, 1); continue; }
+
+        const al = p.life * p.life;
+        const sz = p.size * (0.5 + p.life * 0.5);
+
+        // color interpolation for custom particles
+        let pColor = p.color ?? colorStr;
+        if (cp?.enabled && !p.color) {
+          const f = 1 - p.life;
+          const cr = cp.color_start[0] + (cp.color_end[0] - cp.color_start[0]) * f;
+          const cg = cp.color_start[1] + (cp.color_end[1] - cp.color_start[1]) * f;
+          const cbl = cp.color_start[2] + (cp.color_end[2] - cp.color_start[2]) * f;
+          pColor = `rgb(${Math.round(cr)},${Math.round(cg)},${Math.round(cbl)})`;
+        }
+
+        if (p.glow > 0.3) {
+          const gR = sz * p.glow * 2.5;
+          const gG = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, gR);
+          gG.addColorStop(0, p.color ?? ca(al * 0.25));
+          gG.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = gG; ctx.beginPath(); ctx.arc(p.x, p.y, gR, 0, Math.PI * 2); ctx.fill();
+        }
+
+        ctx.globalAlpha = al;
+        ctx.fillStyle = pColor;
+
+        if (p.shape === 0) { ctx.beginPath(); ctx.arc(p.x, p.y, sz, 0, Math.PI * 2); ctx.fill(); }
+        else if (p.shape === 1) {
+          if (trailParticle === "HEART") { drawHeart(ctx, p.x, p.y, sz * 1.5); ctx.fill(); }
+          else { drawStar(ctx, p.x, p.y, sz * 1.5, p.rot); ctx.fill(); }
+        }
+        else if (p.shape === 2) { drawDiamond(ctx, p.x, p.y, sz * 1.3, p.rot); ctx.fill(); }
+        else { drawSpark(ctx, p.x, p.y, sz * 2, p.rot); ctx.fill(); }
+      }
+      ctx.globalAlpha = 1;
+
+      if (pp.length > 400) pp.splice(0, pp.length - 400);
+
+      /* ═══════ HUD ═══════ */
+      ctx.fillStyle = ca(0.65); ctx.font = "bold 12px 'Inter',sans-serif"; ctx.textAlign = "left";
+      ctx.fillText(spell.meta.name, 8, 16);
+
+      const tl = castType === "projectile" ? "PROJECTILE" : castType === "area" ? "ZONE" : "INSTANTANÉ";
+      ctx.fillStyle = "rgba(255,255,255,0.12)";
+      const bW = ctx.measureText(tl).width + 10;
+      ctx.fillRect(8, 21, bW, 14);
+      ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "8px 'Inter',sans-serif";
+      ctx.fillText(tl, 13, 31);
+
+      // particle info
+      const pLabel = trailParticle.toLowerCase().replace(/_/g, " ");
+      const pInfo = cp?.enabled ? `${pLabel} (${cp.pattern})` : pLabel;
+      ctx.fillStyle = "rgba(255,255,255,0.2)"; ctx.font = "8px 'Inter',sans-serif"; ctx.textAlign = "left";
+      ctx.fillText(`✦ ${pInfo}`, 8, H - 6);
+
+      ctx.textAlign = "right";
+      ctx.fillText(
+        `CD ${spell.mechanics.cooldown}s  ◆  ${spell.mechanics.mana_cost} mana  ◆  ${spell.mechanics.range}m`,
+        W - 8, H - 6);
+
+      ctx.restore();
+      animRef.current = requestAnimationFrame(draw);
+    };
+
+    animRef.current = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(animRef.current); particles.current = []; tRef.current = 0; };
+  }, [spell, colorStr, ca, cb, spawn, spawnPattern, ps, is, cp]);
+
+  return <canvas ref={canvasRef} width={480} height={300} className="spell-preview-canvas" />;
+}

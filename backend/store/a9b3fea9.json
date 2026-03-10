@@ -1,0 +1,48 @@
+{
+  "meta": {
+    "id": "21d62f20-d748-4d6f-86af-7ce19ff377c7",
+    "name": "miaou",
+    "author": "Geverrr19",
+    "created_at": "2026-02-14T15:02:44.203Z",
+    "version": 1
+  },
+  "mechanics": {
+    "cast_type": "area",
+    "cooldown": 5,
+    "mana_cost": 1,
+    "range": 10,
+    "radius": 20
+  },
+  "effects": [
+    {
+      "type": "damage",
+      "amount": 6,
+      "damage_type": "magic"
+    },
+    {
+      "type": "status",
+      "status": "slow",
+      "duration": 3
+    }
+  ],
+  "visual": {
+    "color": [
+      138,
+      43,
+      226
+    ],
+    "particle_trail": {
+      "particle": "SOUL_FIRE_FLAME",
+      "count": 5,
+      "frequency": 2
+    },
+    "impact": {
+      "particle": "EXPLOSION",
+      "sound": {
+        "key": "ENTITY_BLAZE_SHOOT",
+        "volume": 1,
+        "pitch": 1
+      }
+    }
+  }
+}
