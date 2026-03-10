@@ -11,7 +11,7 @@ import type {
 import type { CustomMob, MobSummary } from "../types/mob";
 import type { CustomModel, ModelSummary } from "../types/model";
 
-const API_BASE = "/api";
+const API_BASE = import.meta.env.VITE_API_URL || "/api";
 
 export async function exportSpell(token: string, spell: Spell): Promise<{ ok: boolean; error?: string; details?: string[] }> {
   try {

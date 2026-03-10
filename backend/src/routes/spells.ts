@@ -1,8 +1,27 @@
 import { Router, Request, Response } from "express";
-import { loadSpell, saveSpell } from "../services/store";
+import { loadSpell, saveSpell, listTokens } from "../services/store";
 import { validateSpell } from "../services/validation";
 
 export const spellsRouter = Router();
+
+/**
+ * GET /api/spells
+ * Liste tous les sorts sauvegardés.
+ */
+spellsRouter.get("/", (_req: Request, res: Response) => {
+  const tokens = listTokens();
+  const spells = tokens.map((token) => {
+    const data = loadSpell(token) as any;
+    return {
+      token,
+      name: data?.meta?.name || "Sans nom",
+      author: data?.meta?.author || "Inconnu",
+      cast_type: data?.mechanics?.cast_type || "unknown",
+      version: data?.meta?.version || 1,
+    };
+  });
+  res.json({ spells });
+});
 
 /**
  * POST /api/spells?token=XYZ

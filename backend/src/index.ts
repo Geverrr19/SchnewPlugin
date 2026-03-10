@@ -3,6 +3,11 @@ import cors from "cors";
 import path from "path";
 import fs from "fs";
 import { spellsRouter } from "./routes/spells";
+import { communityRouter } from "./routes/community";
+import { powersRouter } from "./routes/powers";
+import { mobsRouter } from "./routes/mobs";
+import { modelsRouter } from "./routes/models";
+import { templatesRouter } from "./routes/templates";
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -23,8 +28,13 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-// Routes sorts
+// Routes
 app.use("/api/spells", spellsRouter);
+app.use("/api/community", communityRouter);
+app.use("/api/powers", powersRouter);
+app.use("/api/mobs", mobsRouter);
+app.use("/api/models", modelsRouter);
+app.use("/api/templates", templatesRouter);
 
 // ── Servir le frontend React en production ──
 const publicDir = path.resolve(__dirname, "../public");
